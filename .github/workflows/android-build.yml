@@ -1,0 +1,252 @@
+name: Axion Image Expander Android CI & Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-package:
+    name: Build, Test, and Package Axion Image Expander
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept Android SDK licenses
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [ -z "$SDK_ROOT" ]; then
+            echo "ERROR: ANDROID_HOME / ANDROID_SDK_ROOT is not set."
+            exit 1
+          fi
+          SDKMANAGER_BIN="$(command -v sdkmanager || true)"
+          if [ -z "$SDKMANAGER_BIN" ]; then
+            SDKMANAGER_BIN="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager 2>/dev/null | head -n 1 || true)"
+          fi
+          if [ -n "$SDKMANAGER_BIN" ] && [ -x "$SDKMANAGER_BIN" ]; then
+            set +o pipefail
+            yes | "$SDKMANAGER_BIN" --licenses >/dev/null
+            set -o pipefail
+          else
+            mkdir -p "$SDK_ROOT/licenses"
+          fi
+          echo "Android SDK licenses configured at $SDK_ROOT."
+
+      - name: Set up Gradle & cache
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.3.1"
+
+      - name: Determine Gradle command
+        id: gradle_cmd
+        run: |
+          set -euo pipefail
+          if [ -x "./gradlew" ] && [ -f "./gradle/wrapper/gradle-wrapper.jar" ]; then
+            echo "cmd=./gradlew" >> "$GITHUB_OUTPUT"
+            echo "Using repository Gradle wrapper: ./gradlew"
+          else
+            echo "cmd=gradle" >> "$GITHUB_OUTPUT"
+            echo "Gradle wrapper jar not present; using provisioned gradle (9.3.1)"
+          fi
+
+      - name: Generate temporary debug keystore for CI signing
+        run: |
+          set -euo pipefail
+          if [ ! -f "./debug.keystore" ]; then
+            KEYTOOL_BIN="${JAVA_HOME}/bin/keytool"
+            if [ ! -x "$KEYTOOL_BIN" ]; then
+              KEYTOOL_BIN="$(command -v keytool)"
+            fi
+            "$KEYTOOL_BIN" -genkeypair -noprompt \
+              -keystore ./debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+          test -s "./debug.keystore"
+
+      - name: Run unit tests
+        run: ${{ steps.gradle_cmd.outputs.cmd }} :app:testDebugUnitTest --stacktrace --no-daemon
+
+      - name: Build debug APK
+        run: ${{ steps.gradle_cmd.outputs.cmd }} :app:assembleDebug --stacktrace --no-daemon
+
+      - name: Verify debug APK & prepare deliverable copy
+        id: package_apk
+        run: |
+          set -euo pipefail
+          APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
+          if [ ! -f "$APK_PATH" ] || [ ! -s "$APK_PATH" ]; then
+            echo "ERROR: Expected non-empty APK at $APK_PATH"
+            find app/build/outputs -type f 2>/dev/null || true
+            exit 1
+          fi
+
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          AAPT2_BIN="$(find "$SDK_ROOT/build-tools" -maxdepth 2 -type f -name aapt2 2>/dev/null | sort -V | tail -n 1 || true)"
+          APKSIGNER_BIN="$(find "$SDK_ROOT/build-tools" -maxdepth 2 -type f -name apksigner 2>/dev/null | sort -V | tail -n 1 || true)"
+
+          if [ -n "$AAPT2_BIN" ] && [ -x "$AAPT2_BIN" ]; then
+            BADGING="$("$AAPT2_BIN" dump badging "$APK_PATH")"
+            echo "$BADGING" | grep -E "^(package:|sdkVersion:|targetSdkVersion:|application-label:|launchable-activity:)"
+            if ! echo "$BADGING" | grep -q "package: name='com.axion.imageexpander'"; then
+              echo "ERROR: Application ID mismatch in $APK_PATH"
+              exit 1
+            fi
+          fi
+
+          if [ -n "$APKSIGNER_BIN" ] && [ -x "$APKSIGNER_BIN" ]; then
+            "$APKSIGNER_BIN" verify --print-certs "$APK_PATH"
+          fi
+
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            VERSION_TAG="${GITHUB_REF_NAME}"
+          else
+            VERSION_TAG="v1.0"
+          fi
+          APK_NAME="AXION-IMAGE-EXPANDER-${VERSION_TAG}.apk"
+
+          mkdir -p dist
+          cp "$APK_PATH" "dist/${APK_NAME}"
+          test -s "dist/${APK_NAME}"
+
+          echo "version_tag=${VERSION_TAG}" >> "$GITHUB_OUTPUT"
+          echo "apk_name=${APK_NAME}" >> "$GITHUB_OUTPUT"
+          echo "apk_path=dist/${APK_NAME}" >> "$GITHUB_OUTPUT"
+          echo "Prepared verified APK: dist/${APK_NAME} ($(wc -c < "dist/${APK_NAME}") bytes)"
+
+      - name: Generate clean source ZIP
+        id: package_source
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          python3 - <<'PY'
+          import os
+          import zipfile
+
+          root = "."
+          out_zip = os.path.join("dist", "AXION-IMAGE-EXPANDER-SOURCE.zip")
+          exclude_dirs = {
+              ".git",
+              ".gradle",
+              ".kotlin",
+              ".idea",
+              ".cxx",
+              ".externalNativeBuild",
+              ".build-outputs",
+              "build",
+              "captures",
+              "dist",
+          }
+          exclude_files = {
+              "local.properties",
+              ".env",
+              "debug.keystore",
+              "debug.keystore.base64",
+              "my-upload-key.jks",
+              ".DS_Store",
+          }
+          exclude_exts = (".keystore", ".jks", ".apk", ".aab", ".zip", ".iml", ".pem", ".p12", ".pk8")
+
+          count = 0
+          with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+              for dirpath, dirnames, filenames in os.walk(root):
+                  dirnames[:] = sorted(d for d in dirnames if d not in exclude_dirs)
+                  for fname in sorted(filenames):
+                      if fname in exclude_files or fname.endswith(exclude_exts):
+                          continue
+                      if fname.startswith(".env") and fname != ".env.example":
+                          continue
+                      full = os.path.join(dirpath, fname)
+                      rel = os.path.relpath(full, root)
+                      zf.write(full, arcname=os.path.join("AxionImageExpander", rel))
+                      count += 1
+          print(f"Created {out_zip} with {count} files ({os.path.getsize(out_zip)} bytes)")
+          PY
+          echo "zip_path=dist/AXION-IMAGE-EXPANDER-SOURCE.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package_apk.outputs.apk_name }}
+          path: ${{ steps.package_apk.outputs.apk_path }}
+          if-no-files-found: error
+
+      - name: Upload source ZIP workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AXION-IMAGE-EXPANDER-SOURCE.zip
+          path: ${{ steps.package_source.outputs.zip_path }}
+          if-no-files-found: error
+
+      - name: Publish GitHub Release on version tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION_TAG="${{ steps.package_apk.outputs.version_tag }}"
+          APK_PATH="${{ steps.package_apk.outputs.apk_path }}"
+          ZIP_PATH="${{ steps.package_source.outputs.zip_path }}"
+          RELEASE_TITLE="AXION IMAGE EXPANDER ${VERSION_TAG}"
+
+          NOTES="$(printf '%s\n' \
+            "Automated build & release for **AXION IMAGE EXPANDER (${VERSION_TAG})**." \
+            "" \
+            "- **Package / Application ID:** \`com.axion.imageexpander\`" \
+            "- **Min SDK / Target SDK:** \`26\` / \`36\`" \
+            "- **Unit Tests:** Passed (\`:app:testDebugUnitTest\`)" \
+            "- **Included Assets:** \`$(basename "$APK_PATH")\` and \`$(basename "$ZIP_PATH")\`" \
+            "- **Signing:** Debug keystore (installable test/distribution build)")"
+
+          if gh release view "$VERSION_TAG" >/dev/null 2>&1; then
+            gh release upload "$VERSION_TAG" "$APK_PATH" "$ZIP_PATH" --clobber
+            gh release edit "$VERSION_TAG" --title "$RELEASE_TITLE" --notes "$NOTES"
+          else
+            gh release create "$VERSION_TAG" "$APK_PATH" "$ZIP_PATH" \
+              --title "$RELEASE_TITLE" \
+              --notes "$NOTES" \
+              --target "$GITHUB_SHA" \
+              --latest
+          fi
+
+      - name: Write workflow summary
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "## AXION IMAGE EXPANDER CI Summary"
+            echo ""
+            echo "- **Application ID:** \`com.axion.imageexpander\`"
+            echo "- **APK Artifact:** \`${{ steps.package_apk.outputs.apk_name }}\`"
+            echo "- **Source ZIP Artifact:** \`AXION-IMAGE-EXPANDER-SOURCE.zip\`"
+            if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+              TAG="${{ steps.package_apk.outputs.version_tag }}"
+              APK="${{ steps.package_apk.outputs.apk_name }}"
+              echo "- **Release Page:** https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+              echo "- **Direct APK URL:** https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${APK}"
+              echo "- **Direct Source ZIP URL:** https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/AXION-IMAGE-EXPANDER-SOURCE.zip"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,8 @@
+{
+  "name": "Axion Image Expander",
+  "description": "Offline-capable AI image analysis, text/speech-bubble removal, background removal, and smart 16:9 image outpainting studio for manga, manhua, anime, and creator screenshots.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
